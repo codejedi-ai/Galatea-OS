@@ -1,6 +1,6 @@
 """
 Snowflake Agentic RAG tool: query Snowflake Cortex (RAG/COMPLETE) from the voice agent.
-Use when the agent needs answers from enterprise data or a knowledge base in Snowflake.
+Also writes conversation (user + assistant) to Snowflake when SNOWFLAKE_CHAT_TABLE is set.
 """
 from __future__ import annotations
 
@@ -8,32 +8,121 @@ import asyncio
 import json
 import logging
 import os
+import re
+from datetime import datetime, timezone
 from typing import Any, Optional
+
+import snowflake.connector
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import serialization
 
 logger = logging.getLogger("snowflake-rag-tool")
 
-# Lazy import so agent runs without Snowflake if tool not used
-_connector = None
 
-def _get_connector():
-    global _connector
-    if _connector is None:
-        try:
-            import snowflake.connector
-            _connector = snowflake.connector
-        except ImportError:
-            raise ImportError(
-                "snowflake-connector-python is required for the Snowflake RAG tool. "
-                "Install with: pip install snowflake-connector-python"
+def _get_connection_params() -> Optional[dict[str, Any]]:
+    """Build Snowflake connection params from env. Returns None if not configured."""
+    account = os.getenv("SNOWFLAKE_ACCOUNT")
+    user = os.getenv("SNOWFLAKE_USER")
+    if not account or not user:
+        return None
+    password = os.getenv("SNOWFLAKE_PASSWORD")
+    warehouse = os.getenv("SNOWFLAKE_WAREHOUSE", "")
+    database = os.getenv("SNOWFLAKE_DATABASE", "")
+    schema = os.getenv("SNOWFLAKE_SCHEMA", "")
+    role = os.getenv("SNOWFLAKE_ROLE")
+    connect_params: dict[str, Any] = {
+        "account": account.strip(),
+        "user": user.strip(),
+        "warehouse": warehouse.strip() or None,
+        "database": database.strip() or None,
+        "schema": schema.strip() or None,
+    }
+    if password:
+        connect_params["password"] = password.strip().strip('"').strip("'")
+    elif os.getenv("SNOWFLAKE_PRIVATE_KEY_PATH"):
+        with open(os.environ["SNOWFLAKE_PRIVATE_KEY_PATH"], "rb") as f:
+            pkey = serialization.load_pem_private_key(
+                f.read(),
+                password=os.getenv("SNOWFLAKE_PRIVATE_KEY_PASS") or None,
+                backend=default_backend(),
             )
-    return _connector
+        connect_params["private_key"] = pkey
+    else:
+        return None
+    if role:
+        connect_params["role"] = role.strip()
+    return connect_params
+
+
+def _write_chat_to_snowflake_sync(
+    session_id: str,
+    participant_id: str,
+    role: str,
+    message: str,
+    agent_name: str,
+) -> None:
+    """Write one chat row to Snowflake. No-op if SNOWFLAKE_CHAT_TABLE is not set."""
+    table = (os.getenv("SNOWFLAKE_CHAT_TABLE") or "").strip()
+    if not table or not message or not message.strip():
+        return
+    if not re.match(r"^[a-zA-Z0-9_]+$", table):
+        logger.warning("SNOWFLAKE_CHAT_TABLE must be a single identifier (letters, numbers, underscore)")
+        return
+    params = _get_connection_params()
+    if not params:
+        logger.warning("Snowflake chat logging skipped: connection not configured")
+        return
+    conn = None
+    try:
+        db = os.getenv("SNOWFLAKE_CHAT_DATABASE") or params.get("database")
+        sch = os.getenv("SNOWFLAKE_CHAT_SCHEMA") or params.get("schema")
+        if db:
+            params = {**params, "database": db}
+        if sch:
+            params = {**params, "schema": sch}
+        conn = snowflake.connector.connect(**params)
+        cursor = conn.cursor()
+        created_at = datetime.now(timezone.utc).isoformat()
+        # Table expected: session_id, participant_id, role, message, agent_name, created_at
+        sql = (
+            f'INSERT INTO "{table}" (session_id, participant_id, role, message, agent_name, created_at) '
+            "VALUES (%s, %s, %s, %s, %s, %s)"
+        )
+        cursor.execute(
+            sql,
+            (session_id, participant_id, role, (message or "").strip()[:65535], agent_name or "", created_at),
+        )
+        conn.commit()
+        cursor.close()
+    except Exception as e:
+        logger.exception("Snowflake chat write error: %s", e)
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+async def write_chat_to_snowflake(
+    session_id: str,
+    participant_id: str,
+    role: str,
+    message: str,
+    agent_name: str = "",
+) -> None:
+    """Write a conversation turn to Snowflake (async). No-op if SNOWFLAKE_CHAT_TABLE unset."""
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(
+        None,
+        lambda: _write_chat_to_snowflake_sync(session_id, participant_id, role, message, agent_name),
+    )
 
 
 def _run_snowflake_sync(question: str, model: str, system_instruction: Optional[str], custom_sql: Optional[str]) -> str:
     """Run Snowflake Cortex COMPLETE (or custom RAG SQL) in a sync way. Call from async via to_thread."""
     conn = None
     try:
-        snowflake = _get_connector()
         account = os.getenv("SNOWFLAKE_ACCOUNT")
         user = os.getenv("SNOWFLAKE_USER")
         password = os.getenv("SNOWFLAKE_PASSWORD")
@@ -56,8 +145,6 @@ def _run_snowflake_sync(question: str, model: str, system_instruction: Optional[
             connect_params["password"] = password.strip().strip('"').strip("'")
         elif os.getenv("SNOWFLAKE_PRIVATE_KEY_PATH"):
             with open(os.environ["SNOWFLAKE_PRIVATE_KEY_PATH"], "rb") as f:
-                from cryptography.hazmat.primitives import serialization
-                from cryptography.hazmat.backends import default_backend
                 pkey = serialization.load_pem_private_key(
                     f.read(),
                     password=os.getenv("SNOWFLAKE_PRIVATE_KEY_PASS") or None,
@@ -70,7 +157,7 @@ def _run_snowflake_sync(question: str, model: str, system_instruction: Optional[
         if role:
             connect_params["role"] = role.strip()
 
-        conn = snowflake.connect(**connect_params)
+        conn = snowflake.connector.connect(**connect_params)
         cursor = conn.cursor()
 
         if custom_sql:

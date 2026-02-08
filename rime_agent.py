@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import random
 import os
@@ -11,12 +12,14 @@ from livekit.agents import (
     AutoSubscribe,
     JobContext,
     JobProcess,
+    RunContext,
     tts,
     metrics,
     RoomInputOptions,
     RoomOutputOptions,
     WorkerOptions,
-    cli
+    cli,
+    function_tool,
 )
 from livekit.agents.voice import MetricsCollectedEvent
 from livekit.plugins import (
@@ -30,6 +33,7 @@ from livekit.agents.tokenize import tokenizer
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 from agent_configs import VOICE_CONFIGS
+from tools.snowflake_rag_tool import get_snowflake_rag_response, write_chat_to_snowflake
 
 load_dotenv()
 logger = logging.getLogger("voice-agent")
@@ -56,6 +60,20 @@ class RimeAssistant(Agent):
         if prompt is None:
             prompt = VOICE_CONFIGS[VOICE]["llm_prompt"]
         super().__init__(instructions=prompt)
+
+
+class RimeAssistantWithSnowflakeRAG(Agent):
+    """Agent with Snowflake Agentic RAG tool for querying enterprise data / knowledge base."""
+
+    def __init__(self, prompt: str) -> None:
+        super().__init__(instructions=prompt)
+
+    @function_tool(
+        description="Query the Snowflake-backed knowledge base or enterprise data. Use when the user asks about data, documents, or information that might be in the company's Snowflake database. Pass their question as-is."
+    )
+    async def snowflake_rag_tool(self, ctx: RunContext, question: str) -> str:
+        """Ask the Snowflake RAG/Cortex for an answer to the user's question."""
+        return await get_snowflake_rag_response(question)
 
 
 async def entrypoint(ctx: JobContext):
@@ -116,15 +134,43 @@ async def entrypoint(ctx: JobContext):
         metrics.log_metrics(ev.metrics)
         usage_collector.collect(ev.metrics)
 
+    # Write each conversation turn (user + assistant) to Snowflake when SNOWFLAKE_CHAT_TABLE is set
+    session_id = ctx.room.sid or ctx.room.name or "unknown"
+    participant_id = participant.identity or "unknown"
+    agent_name = (LOADED_CONFIG or {}).get("name", "agent") or "agent"
+
+    @session.on("conversation_item_added")
+    def _on_conversation_item_added(ev):
+        try:
+            item = getattr(ev, "item", ev)
+            role = getattr(item, "role", None) or getattr(item, "message", {}).get("role", "user")
+            text = getattr(item, "text_content", None) or getattr(item, "content", None) or ""
+            if isinstance(text, list):
+                text = " ".join(str(c) for c in text if isinstance(c, str))
+            if role and str(text).strip():
+                asyncio.create_task(
+                    write_chat_to_snowflake(session_id, participant_id, role, str(text), agent_name)
+                )
+        except Exception as e:
+            logger.debug("Snowflake chat log skip: %s", e)
+
     async def log_usage():
         summary = usage_collector.get_summary()
         logger.info(f"Usage: {summary}")
 
     ctx.add_shutdown_callback(log_usage)
 
+    # Use agent with Snowflake RAG tool when config requests it
+    tools_list = (LOADED_CONFIG or {}).get("tools") or []
+    if "snowflake_rag" in tools_list:
+        agent = RimeAssistantWithSnowflakeRAG(prompt=llm_prompt)
+        logger.info("Agent has Snowflake Agentic RAG tool enabled")
+    else:
+        agent = RimeAssistant(prompt=llm_prompt)
+
     await session.start(
         room=ctx.room,
-        agent=RimeAssistant(prompt=llm_prompt),
+        agent=agent,
         room_input_options=RoomInputOptions(
             noise_cancellation=noise_cancellation.BVC()
         ),

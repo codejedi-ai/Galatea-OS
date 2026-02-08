@@ -23,24 +23,54 @@ If the agent already has other tools (e.g. Rime or MCP tools), add it to the lis
 "tools": ["deep_thinking", "empathy", "snowflake_rag"]
 ```
 
-## Environment variables
+## Environment variables you need
 
-In `.env`:
+All Snowflake-related variables go in `.env`. Use the ones you need for connection, RAG, and/or chat logging.
+
+### Connection (required for RAG tool or chat logging)
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `SNOWFLAKE_ACCOUNT` | Yes | Account identifier (e.g. `xy12345.us-east-1`) |
-| `SNOWFLAKE_USER` | Yes | Login name |
+| `SNOWFLAKE_ACCOUNT` | **Yes** | Account identifier (e.g. `xy12345.us-east-1`) |
+| `SNOWFLAKE_USER` | **Yes** | Login name |
 | `SNOWFLAKE_PASSWORD` | Yes* | Password (*or use key-based auth below) |
-| `SNOWFLAKE_WAREHOUSE` | No | Warehouse name |
+| `SNOWFLAKE_WAREHOUSE` | No | Warehouse name (needed for queries) |
 | `SNOWFLAKE_DATABASE` | No | Default database |
 | `SNOWFLAKE_SCHEMA` | No | Default schema |
-| `SNOWFLAKE_ROLE` | No | Role (e.g. `SNOWFLAKE.CORTEX_USER`) |
+| `SNOWFLAKE_ROLE` | No | Role (e.g. `SNOWFLAKE.CORTEX_USER` for Cortex) |
+
+For **key-based auth** instead of password: set `SNOWFLAKE_PRIVATE_KEY_PATH` (path to PEM file) and optionally `SNOWFLAKE_PRIVATE_KEY_PASS` if the key is encrypted.
+
+### RAG tool only (when agent has `snowflake_rag` in `tools`)
+
+| Variable | Required | Description |
+|----------|----------|-------------|
 | `SNOWFLAKE_RAG_MODEL` | No | Cortex model (default: `mistral-large`) |
 | `SNOWFLAKE_RAG_SYSTEM_INSTRUCTION` | No | System prompt for the Cortex call |
-| `SNOWFLAKE_RAG_SQL` | No | Custom SQL with one `?` for the question |
+| `SNOWFLAKE_RAG_SQL` | No | Custom SQL with one `?` for the question (e.g. `CALL my_schema.my_rag_procedure(?)`) |
 
-For key-based auth, use `SNOWFLAKE_PRIVATE_KEY_PATH` (and optionally `SNOWFLAKE_PRIVATE_KEY_PASS`) instead of `SNOWFLAKE_PASSWORD`.
+### Chat logging (writing user + assistant messages to Snowflake)
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `SNOWFLAKE_CHAT_TABLE` | No | If set, every user and assistant message is written to this table (e.g. `CHAT_LOGS`) |
+| `SNOWFLAKE_CHAT_DATABASE` | No | Database for the chat table (default: `SNOWFLAKE_DATABASE`) |
+| `SNOWFLAKE_CHAT_SCHEMA` | No | Schema for the chat table (default: `SNOWFLAKE_SCHEMA`) |
+
+**Chat table schema:** Create the table in Snowflake with these columns (name and types must match):
+
+```sql
+CREATE TABLE my_schema.CHAT_LOGS (
+  session_id    VARCHAR,
+  participant_id VARCHAR,
+  role          VARCHAR,   -- 'user' or 'assistant'
+  message       VARCHAR,
+  agent_name    VARCHAR,
+  created_at    VARCHAR
+);
+```
+
+If `SNOWFLAKE_CHAT_TABLE` is not set, no rows are written (chat logging is off).
 
 ## Default behavior (no custom SQL)
 
@@ -69,13 +99,37 @@ To plug in your own RAG pipeline (embed → search → complete):
 
    The `?` is replaced with the user’s question. The tool expects one result value (e.g. one column) that it returns to the agent.
 
-## Dependency
+## Minimal .env example
 
-```bash
-pip install snowflake-connector-python
+**RAG only (no chat logging):**
+
+```env
+SNOWFLAKE_ACCOUNT=xy12345.us-east-1
+SNOWFLAKE_USER=my_user
+SNOWFLAKE_PASSWORD=my_secret
+SNOWFLAKE_WAREHOUSE=COMPUTE_WH
+SNOWFLAKE_DATABASE=MY_DB
+SNOWFLAKE_SCHEMA=MY_SCHEMA
+SNOWFLAKE_ROLE=SNOWFLAKE.CORTEX_USER
 ```
 
-It is already listed in `requirements.txt`.
+**RAG + write every conversation to Snowflake:**
+
+Add the same connection vars above, then create the table (see schema above) and set:
+
+```env
+SNOWFLAKE_CHAT_TABLE=CHAT_LOGS
+SNOWFLAKE_CHAT_DATABASE=MY_DB
+SNOWFLAKE_CHAT_SCHEMA=MY_SCHEMA
+```
+
+## Dependencies
+
+```bash
+pip install snowflake-connector-python cryptography
+```
+
+Both are listed in `requirements.txt`.
 
 ## References
 

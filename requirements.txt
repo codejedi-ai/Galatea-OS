@@ -10,6 +10,7 @@ certifi
 cffi
 charset-normalizer
 click
+cryptography
 colorama
 coloredlogs
 distro
@@ -60,6 +61,7 @@ regex
 requests
 safetensors
 sniffio
+snowflake-connector-python
 sounddevice
 sympy
 tokenizers
