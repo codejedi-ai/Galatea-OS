@@ -24,7 +24,6 @@ from livekit.plugins import (
     noise_cancellation,
     rime,
     silero,
-    tavus,
 )
 from livekit.agents.tokenize import tokenizer
 
@@ -123,27 +122,13 @@ async def entrypoint(ctx: JobContext):
 
     ctx.add_shutdown_callback(log_usage)
 
-    persona_id = os.getenv("TAVUS_PERSONA_ID")
-    replica_id = os.getenv("TAVUS_REPLICA_ID")
-
-    # --- Tavus integration ---
-    avatar = tavus.AvatarSession(
-        replica_id=replica_id,      # Replace with your actual replica ID
-        persona_id=persona_id,      # Replace with your actual persona ID
-        # Optional: avatar_participant_name="Tavus-avatar-agent"
-    )
-    await avatar.start(session, room=ctx.room)
-    # -------------------------
-
     await session.start(
         room=ctx.room,
         agent=RimeAssistant(prompt=llm_prompt),
         room_input_options=RoomInputOptions(
             noise_cancellation=noise_cancellation.BVC()
         ),
-        room_output_options=RoomOutputOptions(
-            audio_enabled=False  # Tavus handles audio separately
-        )
+        room_output_options=RoomOutputOptions(audio_enabled=True),
     )
 
     await session.say(intro_phrase)
